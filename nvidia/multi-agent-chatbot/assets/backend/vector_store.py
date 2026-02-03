@@ -15,6 +15,7 @@
 # limitations under the License.
 #
 import glob
+import time
 from typing import List, Tuple
 import os
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -99,17 +100,47 @@ class VectorStore:
             raise
     
     def _initialize_store(self):
-        self._store = Milvus(
-            embedding_function=self.embeddings,
-            collection_name="context",
-            connection_args={"uri": self.uri},
-            auto_id=True
-        )
-        logger.debug({
-            "message": "Milvus vector store initialized",
+        max_attempts = max(1, int(os.getenv("MILVUS_INIT_RETRIES", "15")))
+        delay_seconds = float(os.getenv("MILVUS_INIT_DELAY", "2"))
+        last_error: Exception | None = None
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                self._store = Milvus(
+                    embedding_function=self.embeddings,
+                    collection_name="context",
+                    connection_args={"uri": self.uri},
+                    auto_id=True
+                )
+                logger.debug({
+                    "message": "Milvus vector store initialized",
+                    "uri": self.uri,
+                    "collection": "context",
+                    "attempt": attempt
+                })
+                return
+            except Exception as e:
+                last_error = e
+                if attempt >= max_attempts:
+                    break
+                logger.warning({
+                    "message": "Milvus not ready yet, retrying initialization",
+                    "uri": self.uri,
+                    "attempt": attempt,
+                    "max_attempts": max_attempts,
+                    "delay_seconds": delay_seconds,
+                    "error": str(e)
+                })
+                time.sleep(delay_seconds)
+                delay_seconds = min(delay_seconds * 1.5, 15.0)
+
+        logger.error({
+            "message": "Failed to initialize Milvus vector store after retries",
             "uri": self.uri,
-            "collection": "context"
+            "attempts": max_attempts,
+            "error": str(last_error)
         })
+        raise last_error
 
     def _load_documents(self, file_paths: List[str] = None, input_dir: str = None) -> List[str]:
         try:
