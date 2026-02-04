@@ -223,5 +223,48 @@ class MCPClient:
             tools = await self.mcp_client.get_tools()
             return tools
         except Exception as error:
-            print("Error encountered connecting to MCP server. Is the server running? Is your config server path correct?\n")
+            # Retry once if the Revit MCP URL might be redirecting between /mcp and /mcp/
+            retried = False
+            if self._maybe_toggle_revit_mcp_trailing_slash():
+                retried = True
+                try:
+                    tools = await self.mcp_client.get_tools()
+                    return tools
+                except Exception:
+                    pass
+            if retried:
+                print("Error encountered connecting to MCP server after retrying /mcp vs /mcp/.\n")
+            else:
+                print("Error encountered connecting to MCP server. Is the server running? Is your config server path correct?\n")
             raise error
+
+    @staticmethod
+    def _alternate_mcp_url(url: str) -> Optional[str]:
+        if not url:
+            return None
+        parts = urlsplit(url)
+        path = parts.path or "/"
+        if path.endswith("/mcp/"):
+            new_path = path[:-1]
+        elif path.endswith("/mcp"):
+            new_path = path + "/"
+        else:
+            return None
+        return urlunsplit((parts.scheme, parts.netloc, new_path, parts.query, parts.fragment))
+
+    def _maybe_toggle_revit_mcp_trailing_slash(self) -> bool:
+        config = self.server_configs.get("revit-mcp-server")
+        if not config:
+            return False
+        url = config.get("url")
+        if not url:
+            return False
+        alt_url = self._alternate_mcp_url(url)
+        if not alt_url or alt_url == url:
+            return False
+        new_config = dict(config)
+        new_config["url"] = alt_url
+        self.server_configs["revit-mcp-server"] = new_config
+        # Reinitialize the client with the toggled URL
+        self.mcp_client = MultiServerMCPClient(self.server_configs)
+        return True

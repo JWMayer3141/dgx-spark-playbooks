@@ -24,9 +24,11 @@ This module provides the main HTTP API endpoints and WebSocket connections for:
 - Vector store operations
 """
 
+import asyncio
 import base64
 import json
 import os
+import time
 import uuid
 from contextlib import asynccontextmanager
 from typing import List, Optional, Dict
@@ -110,6 +112,47 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+async def _probe_revit_mcp_health(
+    revit_mcp_url: str | None,
+    revit_mcp_transport: str | None,
+    timeout_seconds: float = 3.0,
+) -> Dict[str, object]:
+    if not revit_mcp_url:
+        return {"status": "unconfigured", "error": "revit_mcp_url is missing"}
+
+    normalized_transport = MCPClient._normalize_revit_transport(
+        revit_mcp_url, revit_mcp_transport, default="streamable_http"
+    )
+    normalized_url = MCPClient._normalize_revit_url(revit_mcp_url, normalized_transport)
+
+    started = time.monotonic()
+    client = MCPClient(
+        include_base=False,
+        include_revit=True,
+        revit_override={"url": normalized_url, "transport": normalized_transport},
+    )
+    try:
+        await client.init()
+        tools = await asyncio.wait_for(client.get_tools(), timeout=timeout_seconds)
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        return {
+            "status": "healthy",
+            "revit_mcp_url": normalized_url,
+            "revit_mcp_transport": normalized_transport,
+            "tool_count": len(tools or []),
+            "elapsed_ms": elapsed_ms,
+        }
+    except Exception as exc:
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        return {
+            "status": "unhealthy",
+            "revit_mcp_url": normalized_url,
+            "revit_mcp_transport": normalized_transport,
+            "error": str(exc),
+            "elapsed_ms": elapsed_ms,
+        }
 
 
 @app.websocket("/ws/chat/{chat_id}")
@@ -472,30 +515,7 @@ async def auto_set_chat_revit_config(chat_id: str, request: Request):
         if not await postgres_storage.exists(chat_id):
             raise HTTPException(status_code=404, detail=f"Chat {chat_id} not found")
 
-        forwarded_for = request.headers.get("x-forwarded-for")
-        client_ip = forwarded_for.split(",")[0].strip() if forwarded_for else request.client.host
-        transport_header = request.headers.get("x-revit-mcp-transport", "").strip()
-        normalized_transport = MCPClient._normalize_revit_transport(
-            None, transport_header, default="streamable_http"
-        )
-
-        port_header = request.headers.get("x-revit-mcp-port", "").strip()
-        if port_header:
-            port = port_header
-        else:
-            port = "8010" if normalized_transport == "sse" else "8000"
-
-        path_header = request.headers.get("x-revit-mcp-path", "").strip()
-        if path_header:
-            path = path_header
-        else:
-            path = "/mcp" if normalized_transport in {"sse", "streamable_http"} else "/"
-
-        if not path.startswith("/"):
-            path = f"/{path}"
-
-        revit_mcp_url = f"http://{client_ip}:{port}{path}"
-        revit_mcp_url = MCPClient._normalize_revit_url(revit_mcp_url, normalized_transport)
+        revit_mcp_url, normalized_transport, client_ip = _resolve_revit_mcp_from_request(request)
 
         logger.info(
             "Received MCP registration for chat %s: url=%s transport=%s (auto)",
@@ -522,6 +542,73 @@ async def auto_set_chat_revit_config(chat_id: str, request: Request):
         raise HTTPException(
             status_code=500,
             detail=f"Error auto-configuring Revit MCP settings: {str(e)}"
+        )
+
+
+def _resolve_revit_mcp_from_request(request: Request) -> tuple[str, str, str]:
+    """Resolve Revit MCP URL + transport using headers or caller IP defaults."""
+    forwarded_for = request.headers.get("x-forwarded-for")
+    client_ip = forwarded_for.split(",")[0].strip() if forwarded_for else request.client.host
+
+    url_header = request.headers.get("x-revit-mcp-url", "").strip()
+    transport_header = request.headers.get("x-revit-mcp-transport", "").strip()
+
+    if url_header:
+        normalized_transport = MCPClient._normalize_revit_transport(
+            url_header, transport_header, default="streamable_http"
+        )
+        normalized_url = MCPClient._normalize_revit_url(url_header, normalized_transport)
+        return normalized_url, normalized_transport, client_ip
+
+    normalized_transport = MCPClient._normalize_revit_transport(
+        None, transport_header, default="streamable_http"
+    )
+
+    port_header = request.headers.get("x-revit-mcp-port", "").strip()
+    port = port_header or ("8010" if normalized_transport == "sse" else "8000")
+
+    path_header = request.headers.get("x-revit-mcp-path", "").strip()
+    path = path_header or ("/mcp" if normalized_transport in {"sse", "streamable_http"} else "/")
+    if not path.startswith("/"):
+        path = f"/{path}"
+
+    revit_mcp_url = f"http://{client_ip}:{port}{path}"
+    revit_mcp_url = MCPClient._normalize_revit_url(revit_mcp_url, normalized_transport)
+    return revit_mcp_url, normalized_transport, client_ip
+
+
+@app.get("/revit/health")
+async def get_revit_health(request: Request):
+    """Check Revit MCP health using headers or caller IP."""
+    try:
+        revit_mcp_url, normalized_transport, client_ip = _resolve_revit_mcp_from_request(request)
+        payload = await _probe_revit_mcp_health(revit_mcp_url, normalized_transport)
+        payload["detected_ip"] = client_ip
+        return payload
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error checking Revit MCP health: {str(e)}"
+        )
+
+
+@app.get("/chat/{chat_id}/revit/health")
+async def get_chat_revit_health(chat_id: str):
+    """Check Revit MCP health using the stored chat configuration."""
+    try:
+        if not await postgres_storage.exists(chat_id):
+            raise HTTPException(status_code=404, detail=f"Chat {chat_id} not found")
+
+        settings = await postgres_storage.get_chat_settings(chat_id)
+        revit_mcp_url = settings.get("revit_mcp_url")
+        revit_mcp_transport = settings.get("revit_mcp_transport")
+        return await _probe_revit_mcp_health(revit_mcp_url, revit_mcp_transport)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error checking Revit MCP health: {str(e)}"
         )
 
 

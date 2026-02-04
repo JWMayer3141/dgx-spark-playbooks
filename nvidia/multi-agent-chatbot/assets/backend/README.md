@@ -92,6 +92,17 @@ curl -X POST http://localhost:8000/chat/<chat_id>/revit/auto \
   -H "x-revit-mcp-transport: streamable_http"
 ```
 
+Health checks:
+```bash
+# Uses the saved MCP URL/transport for the chat
+curl http://localhost:8000/chat/<chat_id>/revit/health
+
+# Uses caller headers (no chat required)
+curl http://localhost:8000/revit/health \
+  -H "x-revit-mcp-url: http://<windows-ip>:8000/mcp" \
+  -H "x-revit-mcp-transport: streamable_http"
+```
+
 ## Docker Troubleshooting
 
 ### Container Issues
