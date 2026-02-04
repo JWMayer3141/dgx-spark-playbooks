@@ -35,6 +35,7 @@ from fastapi import FastAPI, File, Form, UploadFile, HTTPException, BackgroundTa
 from fastapi.middleware.cors import CORSMiddleware
 
 from agent import ChatAgent
+from client import MCPClient
 from config import ConfigManager
 from logger import logger, log_request, log_response, log_error
 from models import ChatIdRequest, ChatRenameRequest, SelectedModelRequest, ChatRevitConfigRequest
@@ -423,10 +424,27 @@ async def set_chat_revit_config(chat_id: str, request: ChatRevitConfigRequest):
         if not await postgres_storage.exists(chat_id):
             raise HTTPException(status_code=404, detail=f"Chat {chat_id} not found")
 
+        raw_url = (request.revit_mcp_url or "").strip() or None
+        normalized_transport = MCPClient._normalize_revit_transport(
+            raw_url, request.revit_mcp_transport, default="streamable_http"
+        ) if raw_url or request.revit_mcp_transport else None
+        normalized_url = (
+            MCPClient._normalize_revit_url(raw_url, normalized_transport)
+            if raw_url and normalized_transport
+            else raw_url
+        )
+
+        logger.info(
+            "Received MCP registration for chat %s: url=%s transport=%s",
+            chat_id,
+            normalized_url,
+            (normalized_transport or "").strip() or None,
+        )
+
         await postgres_storage.set_chat_settings(
             chat_id,
-            request.revit_mcp_url,
-            request.revit_mcp_transport,
+            normalized_url,
+            normalized_transport,
         )
 
         if agent:
@@ -435,8 +453,8 @@ async def set_chat_revit_config(chat_id: str, request: ChatRevitConfigRequest):
         return {
             "status": "success",
             "chat_id": chat_id,
-            "revit_mcp_url": (request.revit_mcp_url or "").strip() or None,
-            "revit_mcp_transport": (request.revit_mcp_transport or "").strip() or None,
+            "revit_mcp_url": normalized_url,
+            "revit_mcp_transport": (normalized_transport or "").strip() or None,
         }
     except HTTPException:
         raise
@@ -456,16 +474,37 @@ async def auto_set_chat_revit_config(chat_id: str, request: Request):
 
         forwarded_for = request.headers.get("x-forwarded-for")
         client_ip = forwarded_for.split(",")[0].strip() if forwarded_for else request.client.host
-        port = request.headers.get("x-revit-mcp-port", "8000").strip()
-        path = request.headers.get("x-revit-mcp-path", "/mcp").strip() or "/mcp"
-        transport = request.headers.get("x-revit-mcp-transport", "http").strip() or "http"
+        transport_header = request.headers.get("x-revit-mcp-transport", "").strip()
+        normalized_transport = MCPClient._normalize_revit_transport(
+            None, transport_header, default="streamable_http"
+        )
+
+        port_header = request.headers.get("x-revit-mcp-port", "").strip()
+        if port_header:
+            port = port_header
+        else:
+            port = "8010" if normalized_transport == "sse" else "8000"
+
+        path_header = request.headers.get("x-revit-mcp-path", "").strip()
+        if path_header:
+            path = path_header
+        else:
+            path = "/mcp" if normalized_transport in {"sse", "streamable_http"} else "/"
 
         if not path.startswith("/"):
             path = f"/{path}"
 
         revit_mcp_url = f"http://{client_ip}:{port}{path}"
+        revit_mcp_url = MCPClient._normalize_revit_url(revit_mcp_url, normalized_transport)
 
-        await postgres_storage.set_chat_settings(chat_id, revit_mcp_url, transport)
+        logger.info(
+            "Received MCP registration for chat %s: url=%s transport=%s (auto)",
+            chat_id,
+            revit_mcp_url,
+            normalized_transport,
+        )
+
+        await postgres_storage.set_chat_settings(chat_id, revit_mcp_url, normalized_transport)
 
         if agent:
             agent.clear_chat_tool_cache(chat_id)
@@ -474,7 +513,7 @@ async def auto_set_chat_revit_config(chat_id: str, request: Request):
             "status": "success",
             "chat_id": chat_id,
             "revit_mcp_url": revit_mcp_url,
-            "revit_mcp_transport": transport,
+            "revit_mcp_transport": normalized_transport,
             "detected_ip": client_ip,
         }
     except HTTPException:

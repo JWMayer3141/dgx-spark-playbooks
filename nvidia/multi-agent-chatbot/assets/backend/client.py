@@ -23,6 +23,7 @@ initialization, and tool retrieval across different server types.
 
 import os
 import shlex
+from urllib.parse import urlsplit, urlunsplit
 from typing import List, Optional, Dict, Any
 
 from langchain_mcp_adapters.client import MultiServerMCPClient
@@ -82,9 +83,11 @@ class MCPClient:
 
     @classmethod
     def build_revit_url_config(cls, url: str, transport: str | None = None) -> Dict[str, Any]:
+        normalized_transport = cls._normalize_revit_transport(url, transport, default="streamable_http")
+        normalized_url = cls._normalize_revit_url(url, normalized_transport)
         return {
-            "transport": cls._normalize_transport(transport, default="streamable_http"),
-            "url": url,
+            "transport": normalized_transport,
+            "url": normalized_url,
         }
 
     @classmethod
@@ -101,12 +104,8 @@ class MCPClient:
         """
         revit_url = os.getenv("REVIT_MCP_URL")
         transport_env = os.getenv("REVIT_MCP_TRANSPORT")
-        transport = cls._normalize_transport(transport_env, default="streamable_http")
         if revit_url:
-            return {
-                "transport": transport,
-                "url": revit_url,
-            }
+            return cls.build_revit_url_config(revit_url, transport_env)
         
         revit_main = os.getenv("REVIT_MCP_MAIN")
         command = os.getenv("REVIT_MCP_COMMAND")
@@ -137,11 +136,48 @@ class MCPClient:
         if not value:
             return default
         normalized = value.strip().lower().replace("-", "_").replace(" ", "_")
-        if normalized in {"http", "streamable_http"}:
+        if normalized in {"streamable_http", "streamable"}:
             return "streamable_http"
-        if normalized in {"stdio", "sse"}:
-            return normalized
+        if normalized in {"http", "sse"}:
+            return "sse"
+        if normalized in {"stdio"}:
+            return "stdio"
         return normalized
+
+    @classmethod
+    def _normalize_revit_transport(
+        cls, url: str | None, transport: str | None, default: str
+    ) -> str:
+        """Normalize transport using URL heuristics when ambiguous."""
+        if transport:
+            raw = transport.strip().lower().replace("-", "_").replace(" ", "_")
+            if raw == "http":
+                # Prefer streamable_http unless URL strongly suggests SSE (e.g., port 8010).
+                if url:
+                    parts = urlsplit(url)
+                    if parts.port == 8010:
+                        return "sse"
+                return "streamable_http"
+            return cls._normalize_transport(transport, default=default)
+
+        if url:
+            parts = urlsplit(url)
+            # Heuristic: port 8010 is commonly used for SSE mode.
+            if parts.port == 8010:
+                return "sse"
+        return default
+
+    @staticmethod
+    def _normalize_revit_url(url: str, transport: str) -> str:
+        """Normalize MCP URL path for the chosen transport."""
+        if not url:
+            return url
+        parts = urlsplit(url)
+        path = parts.path or "/"
+        if transport in {"streamable_http", "sse"}:
+            if path.rstrip("/") in {"", "/"}:
+                path = "/mcp"
+        return urlunsplit((parts.scheme, parts.netloc, path, parts.query, parts.fragment))
 
     @classmethod
     def _normalize_revit_config(cls, config: Dict[str, Any] | None) -> Dict[str, Any] | None:

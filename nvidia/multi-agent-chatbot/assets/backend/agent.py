@@ -25,6 +25,7 @@ from typing import AsyncIterator, List, Dict, Any, TypedDict, Optional, Callable
 from langchain_core.messages import HumanMessage, AIMessage, AnyMessage, SystemMessage, ToolMessage, ToolCall
 from langchain_core.utils.function_calling import convert_to_openai_tool
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.graph import END, START, StateGraph
 from openai import AsyncOpenAI
 
@@ -36,7 +37,8 @@ from utils import convert_langgraph_messages_to_openai
 from mcp.types import Tool
 
 
-memory = MemorySaver()
+# Enable pickle fallback to avoid msgpack failures on non-JSON-serializable objects.
+memory = MemorySaver(serde=JsonPlusSerializer(pickle_fallback=True))
 SENTINEL = object()
 StreamCallback = Callable[[Dict[str, Any]], Awaitable[None]]
 
@@ -203,12 +205,18 @@ class ChatAgent:
 
         base_delay, max_retries = 0.2, 5
         revit_tools: List[Tool] = []
+        revit_endpoint = revit_config.get("url") or f'{revit_config.get("command", "")} {" ".join(revit_config.get("args", []))}'.strip()
         for attempt in range(max_retries):
             try:
                 revit_tools = await revit_client.get_tools()
                 break
             except Exception as e:
-                logger.warning(f"Revit MCP tools initialization attempt {attempt + 1} failed: {e}")
+                logger.warning(
+                    "Revit MCP tools initialization attempt %s failed for %s: %s",
+                    attempt + 1,
+                    revit_endpoint,
+                    e,
+                )
                 if attempt == max_retries - 1:
                     logger.error("Revit MCP tools not available after retries; continuing without Revit tools")
                     return {}, []
@@ -216,6 +224,12 @@ class ChatAgent:
 
         tools_by_name = {tool.name: tool for tool in revit_tools}
         openai_tools = self._convert_to_openai_tools(revit_tools)
+
+        logger.info(
+            "Loaded %s tools from MCP at %s",
+            len(revit_tools),
+            revit_endpoint,
+        )
 
         self._revit_tool_cache[cache_key] = {
             "tools_by_name": tools_by_name,
@@ -254,6 +268,14 @@ class ChatAgent:
                     logger.warning(f"Tool name collision for '{name}', Revit tool will override base tool.")
                 tools_by_name[name] = tool
             openai_tools = self._merge_openai_tools(openai_tools, revit_openai_tools)
+
+        logger.info(
+            "Attached tools to chat %s: total=%s (revit=%s base=%s)",
+            chat_id,
+            len(tools_by_name),
+            len(revit_tools_by_name) if revit_config else 0,
+            len(self.base_tools_by_name),
+        )
 
         system_prompt = self._render_system_prompt(tools_by_name)
         self._chat_tool_cache[chat_id] = {
