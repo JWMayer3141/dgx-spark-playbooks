@@ -33,3 +33,7 @@ class ChatRenameRequest(BaseModel):
 
 class SelectedModelRequest(BaseModel):
     model: str      
+
+class ChatRevitConfigRequest(BaseModel):
+    revit_mcp_url: Optional[str] = None
+    revit_mcp_transport: Optional[str] = None

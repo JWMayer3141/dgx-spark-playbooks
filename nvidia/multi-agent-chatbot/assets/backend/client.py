@@ -21,7 +21,9 @@ multiple Model Context Protocol (MCP) servers. It handles server configuration,
 initialization, and tool retrieval across different server types.
 """
 
-from typing import List, Optional
+import os
+import shlex
+from typing import List, Optional, Dict, Any
 
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from mcp.types import Tool
@@ -34,9 +36,28 @@ class MCPClient:
     various MCP servers including RAG, image understanding, and weather services.
     """
     
-    def __init__(self):
+    def __init__(
+        self,
+        include_base: bool = True,
+        include_revit: bool = True,
+        revit_override: Dict[str, Any] | None = None,
+    ):
         """Initialize the MCP client with predefined server configurations."""
-        self.server_configs = {
+        self.server_configs: Dict[str, Any] = {}
+        if include_base:
+            self.server_configs.update(self._build_base_configs())
+
+        if include_revit:
+            revit_config = self._normalize_revit_config(
+                revit_override or self._build_revit_config_from_env()
+            )
+            if revit_config:
+                self.server_configs["revit-mcp-server"] = revit_config
+        self.mcp_client: MultiServerMCPClient | None = None
+
+    @staticmethod
+    def _build_base_configs() -> Dict[str, Any]:
+        return {
             "image-understanding-server": {
                 "command": "python",
                 "args": ["tools/mcp_servers/image_understanding.py"],
@@ -56,9 +77,86 @@ class MCPClient:
                 "command": "python",
                 "args": ["tools/mcp_servers/weather_test.py"],
                 "transport": "stdio",
-            }
+            },
         }
-        self.mcp_client: MultiServerMCPClient | None = None
+
+    @classmethod
+    def build_revit_url_config(cls, url: str, transport: str | None = None) -> Dict[str, Any]:
+        return {
+            "transport": cls._normalize_transport(transport, default="streamable_http"),
+            "url": url,
+        }
+
+    @classmethod
+    def build_revit_config_from_env(cls) -> Dict[str, Any] | None:
+        return cls._build_revit_config_from_env()
+
+    @classmethod
+    def _build_revit_config_from_env(cls) -> Dict[str, Any] | None:
+        """Optionally build config for a Revit MCP server via environment variables.
+        
+        Supported setups:
+        - Streamable HTTP transport: set REVIT_MCP_URL (and optional REVIT_MCP_TRANSPORT)
+        - stdio transport: set REVIT_MCP_MAIN (path to main.py) or REVIT_MCP_COMMAND/REVIT_MCP_ARGS
+        """
+        revit_url = os.getenv("REVIT_MCP_URL")
+        transport_env = os.getenv("REVIT_MCP_TRANSPORT")
+        transport = cls._normalize_transport(transport_env, default="streamable_http")
+        if revit_url:
+            return {
+                "transport": transport,
+                "url": revit_url,
+            }
+        
+        revit_main = os.getenv("REVIT_MCP_MAIN")
+        command = os.getenv("REVIT_MCP_COMMAND")
+        args_env = os.getenv("REVIT_MCP_ARGS")
+        
+        if not any([revit_main, command, args_env]):
+            return None
+        
+        if not command:
+            command = "uv"
+        
+        if not args_env:
+            if not revit_main:
+                raise ValueError("REVIT_MCP_MAIN is required when REVIT_MCP_ARGS is not set.")
+            args = ["run", "--with", "mcp[cli]", "mcp", "run", revit_main]
+        else:
+            args = shlex.split(args_env)
+        
+        return {
+            "command": command,
+            "args": args,
+            "transport": cls._normalize_transport(transport_env, default="stdio"),
+        }
+
+    @staticmethod
+    def _normalize_transport(value: str | None, default: str) -> str:
+        """Normalize MCP transport names for client configs."""
+        if not value:
+            return default
+        normalized = value.strip().lower().replace("-", "_").replace(" ", "_")
+        if normalized in {"http", "streamable_http"}:
+            return "streamable_http"
+        if normalized in {"stdio", "sse"}:
+            return normalized
+        return normalized
+
+    @classmethod
+    def _normalize_revit_config(cls, config: Dict[str, Any] | None) -> Dict[str, Any] | None:
+        if not config:
+            return None
+        normalized = dict(config)
+        if "url" in normalized:
+            normalized["transport"] = cls._normalize_transport(
+                normalized.get("transport"), default="streamable_http"
+            )
+        elif "command" in normalized:
+            normalized["transport"] = cls._normalize_transport(
+                normalized.get("transport"), default="stdio"
+            )
+        return normalized
 
     async def init(self):
         """Initialize the multi-server MCP client.

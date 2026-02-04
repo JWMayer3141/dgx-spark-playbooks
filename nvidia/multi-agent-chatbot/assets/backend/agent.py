@@ -19,7 +19,8 @@
 import asyncio
 import contextlib
 import json
-from typing import AsyncIterator, List, Dict, Any, TypedDict, Optional, Callable, Awaitable
+import os
+from typing import AsyncIterator, List, Dict, Any, TypedDict, Optional, Callable, Awaitable, Tuple
 
 from langchain_core.messages import HumanMessage, AIMessage, AnyMessage, SystemMessage, ToolMessage, ToolCall
 from langchain_core.utils.function_calling import convert_to_openai_tool
@@ -32,6 +33,7 @@ from logger import logger
 from prompts import Prompts
 from postgres_storage import PostgreSQLConversationStorage
 from utils import convert_langgraph_messages_to_openai
+from mcp.types import Tool
 
 
 memory = MemorySaver()
@@ -72,10 +74,16 @@ class ChatAgent:
         self.current_model = None
         self.max_iterations = 3
         
-        self.mcp_client = None
-        self.openai_tools = None
-        self.tools_by_name = None
-        self.system_prompt = None
+        self.base_mcp_client = None
+        self.base_openai_tools: List[Dict[str, Any]] = []
+        self.base_tools_by_name: Dict[str, Tool] = {}
+        self.revit_enabled = os.getenv("REVIT_MCP_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}
+        self.default_revit_config = MCPClient.build_revit_config_from_env() if self.revit_enabled else None
+        self._chat_tool_cache: Dict[str, Dict[str, Any]] = {}
+        self._revit_tool_cache: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+        self._revit_clients: Dict[Tuple[str, str, str], MCPClient] = {}
+        self.prompt_template = Prompts.get_template("supervisor_agent")
+        self.base_system_prompt: Optional[str] = None
         
         self.graph = self._build_graph()
         self.stream_callback = None
@@ -91,14 +99,9 @@ class ChatAgent:
         """
         agent = cls(vector_store, config_manager, postgres_storage)
         await agent.init_tools()
+        agent.base_system_prompt = agent._render_system_prompt(agent.base_tools_by_name)
         
-        available_tools = list(agent.tools_by_name.values()) if agent.tools_by_name else []
-        template_vars = {
-            "tools": "\n".join([f"- {tool.name}: {tool.description}" for tool in available_tools]) if available_tools else "No tools available",
-        }
-        agent.system_prompt = Prompts.get_template("supervisor_agent").render(template_vars)
-        
-        logger.debug(f"Agent initialized with {len(available_tools)} tools.")
+        logger.debug(f"Agent initialized with {len(agent.base_tools_by_name)} base tools.")
         agent.set_current_model(config_manager.get_selected_model())
         return agent
 
@@ -108,14 +111,14 @@ class ChatAgent:
         Sets up the MCP client, retrieves available tools, converts them to OpenAI format,
         and initializes specialized agents like the coding agent.
         """
-        self.mcp_client = await MCPClient().init()
+        self.base_mcp_client = await MCPClient(include_revit=False).init()
         
         base_delay, max_retries = 0.1, 10
         mcp_tools = []
         
         for attempt in range(max_retries):
             try:
-                mcp_tools = await self.mcp_client.get_tools()
+                mcp_tools = await self.base_mcp_client.get_tools()
                 break
             except Exception as e:
                 logger.warning(f"MCP tools initialization attempt {attempt + 1} failed: {e}")
@@ -127,21 +130,142 @@ class ChatAgent:
                 await asyncio.sleep(wait_time)
                 logger.info(f"MCP servers not ready, retrying in {wait_time}s (attempt {attempt + 1}/{max_retries})")
         
-        self.tools_by_name = {tool.name: tool for tool in mcp_tools}
-        logger.debug(f"Loaded {len(mcp_tools)} MCP tools: {list(self.tools_by_name.keys())}")
+        self.base_tools_by_name = {tool.name: tool for tool in mcp_tools}
+        logger.debug(f"Loaded {len(mcp_tools)} base MCP tools: {list(self.base_tools_by_name.keys())}")
         
         if mcp_tools:
             mcp_tools_openai = [convert_to_openai_tool(tool) for tool in mcp_tools]
             logger.debug(f"MCP tools converted to OpenAI format: {mcp_tools_openai}")
             
-            self.openai_tools = [
+            self.base_openai_tools = [
                 {"type": "function", "function": tool['function']} 
                 for tool in mcp_tools_openai
             ]
-            logger.debug(f"Final OpenAI tools format: {self.openai_tools}")
+            logger.debug(f"Final OpenAI tools format: {self.base_openai_tools}")
         else:
-            self.openai_tools = []
-            logger.warning("No MCP tools available - agent will run with limited functionality")
+            self.base_openai_tools = []
+            logger.warning("No base MCP tools available - agent will run with limited functionality")
+
+    def _render_system_prompt(self, tools_by_name: Dict[str, Tool] | None) -> str:
+        available_tools = list(tools_by_name.values()) if tools_by_name else []
+        template_vars = {
+            "tools": "\n".join([f"- {tool.name}: {tool.description}" for tool in available_tools]) if available_tools else "No tools available",
+        }
+        return self.prompt_template.render(template_vars)
+
+    def _convert_to_openai_tools(self, tools: List[Tool]) -> List[Dict[str, Any]]:
+        if not tools:
+            return []
+        mcp_tools_openai = [convert_to_openai_tool(tool) for tool in tools]
+        return [{"type": "function", "function": tool["function"]} for tool in mcp_tools_openai]
+
+    @staticmethod
+    def _merge_openai_tools(
+        base_tools: List[Dict[str, Any]],
+        extra_tools: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        order: List[str] = []
+        tool_map: Dict[str, Dict[str, Any]] = {}
+
+        for tool in base_tools:
+            name = tool.get("function", {}).get("name")
+            if not name:
+                continue
+            tool_map[name] = tool
+            order.append(name)
+
+        for tool in extra_tools:
+            name = tool.get("function", {}).get("name")
+            if not name:
+                continue
+            if name not in tool_map:
+                order.append(name)
+            tool_map[name] = tool
+
+        return [tool_map[name] for name in order]
+
+    @staticmethod
+    def _revit_cache_key(revit_config: Dict[str, Any]) -> Tuple[str, str, str]:
+        if "url" in revit_config:
+            return ("url", revit_config.get("url", ""), revit_config.get("transport", ""))
+        command = revit_config.get("command", "")
+        args = " ".join(revit_config.get("args", []))
+        return ("stdio", f"{command} {args}".strip(), revit_config.get("transport", ""))
+
+    async def _get_revit_tools(self, revit_config: Dict[str, Any]) -> Tuple[Dict[str, Tool], List[Dict[str, Any]]]:
+        cache_key = self._revit_cache_key(revit_config)
+        cached = self._revit_tool_cache.get(cache_key)
+        if cached:
+            return cached["tools_by_name"], cached["openai_tools"]
+
+        revit_client = MCPClient(include_base=False, include_revit=True, revit_override=revit_config)
+        await revit_client.init()
+
+        base_delay, max_retries = 0.2, 5
+        revit_tools: List[Tool] = []
+        for attempt in range(max_retries):
+            try:
+                revit_tools = await revit_client.get_tools()
+                break
+            except Exception as e:
+                logger.warning(f"Revit MCP tools initialization attempt {attempt + 1} failed: {e}")
+                if attempt == max_retries - 1:
+                    logger.error("Revit MCP tools not available after retries; continuing without Revit tools")
+                    return {}, []
+                await asyncio.sleep(base_delay * (2 ** attempt))
+
+        tools_by_name = {tool.name: tool for tool in revit_tools}
+        openai_tools = self._convert_to_openai_tools(revit_tools)
+
+        self._revit_tool_cache[cache_key] = {
+            "tools_by_name": tools_by_name,
+            "openai_tools": openai_tools,
+        }
+        self._revit_clients[cache_key] = revit_client
+
+        return tools_by_name, openai_tools
+
+    async def _get_tools_for_chat(
+        self, chat_id: str
+    ) -> Tuple[Dict[str, Tool], List[Dict[str, Any]], str]:
+        settings = await self.conversation_store.get_chat_settings(chat_id)
+        revit_url = settings.get("revit_mcp_url")
+        revit_transport = settings.get("revit_mcp_transport")
+
+        revit_config = None
+        if self.revit_enabled:
+            if revit_url:
+                revit_config = MCPClient.build_revit_url_config(revit_url, revit_transport)
+            elif self.default_revit_config:
+                revit_config = self.default_revit_config
+
+        revit_key = self._revit_cache_key(revit_config) if revit_config else None
+        cached = self._chat_tool_cache.get(chat_id)
+        if cached and cached.get("revit_key") == revit_key:
+            return cached["tools_by_name"], cached["openai_tools"], cached["system_prompt"]
+
+        tools_by_name = dict(self.base_tools_by_name)
+        openai_tools = list(self.base_openai_tools)
+
+        if revit_config:
+            revit_tools_by_name, revit_openai_tools = await self._get_revit_tools(revit_config)
+            for name, tool in revit_tools_by_name.items():
+                if name in tools_by_name:
+                    logger.warning(f"Tool name collision for '{name}', Revit tool will override base tool.")
+                tools_by_name[name] = tool
+            openai_tools = self._merge_openai_tools(openai_tools, revit_openai_tools)
+
+        system_prompt = self._render_system_prompt(tools_by_name)
+        self._chat_tool_cache[chat_id] = {
+            "revit_key": revit_key,
+            "tools_by_name": tools_by_name,
+            "openai_tools": openai_tools,
+            "system_prompt": system_prompt,
+        }
+        return tools_by_name, openai_tools, system_prompt
+
+    def clear_chat_tool_cache(self, chat_id: str) -> None:
+        self._chat_tool_cache.pop(chat_id, None)
 
     def set_current_model(self, model_name: str) -> None:
         """Set the current model for completions.
@@ -228,19 +352,24 @@ class ChatAgent:
         outputs = []
         messages = state.get("messages", [])
         last_message = messages[-1]
+        chat_id = state.get("chat_id") or ""
+        tools_by_name, _, _ = await self._get_tools_for_chat(chat_id)
         for i, tool_call in enumerate(last_message.tool_calls):
             logger.debug(f'Executing tool {i+1}/{len(last_message.tool_calls)}: {tool_call["name"]} with args: {tool_call["args"]}')
             await self.stream_callback({'type': 'tool_start', 'data': tool_call["name"]})
             
             try:
+                tool = tools_by_name.get(tool_call["name"])
+                if not tool:
+                    raise ValueError(f"Tool '{tool_call['name']}' not available for this chat.")
                 if tool_call["name"] == "explain_image" and state.get("image_data"):
                     tool_args = tool_call["args"].copy()
                     tool_args["image"] = state["image_data"]
                     logger.info(f'Executing tool {tool_call["name"]} with args: {tool_args}')
-                    tool_result = await self.tools_by_name[tool_call["name"]].ainvoke(tool_args)
+                    tool_result = await tool.ainvoke(tool_args)
                     state["process_image_used"] = True
                 else:
-                    tool_result = await self.tools_by_name[tool_call["name"]].ainvoke(tool_call["args"])
+                    tool_result = await tool.ainvoke(tool_call["args"])
                 if "code" in tool_call["name"]:
                     content = str(tool_result)
                 elif isinstance(tool_result, str):
@@ -293,22 +422,24 @@ class ChatAgent:
         await self.stream_callback({'type': 'node_start', 'data': 'generate'})
 
         supports_tools = self.current_model in {"gpt-oss-20b", "gpt-oss-120b"}
-        has_tools = supports_tools and self.openai_tools and len(self.openai_tools) > 0
+        chat_id = state.get("chat_id") or ""
+        _, openai_tools, _ = await self._get_tools_for_chat(chat_id)
+        has_tools = supports_tools and len(openai_tools) > 0
         
         logger.debug({
             "message": "Tool calling debug info",
             "chat_id": state.get("chat_id"),
             "current_model": self.current_model,
             "supports_tools": supports_tools,
-            "openai_tools_count": len(self.openai_tools) if self.openai_tools else 0,
-            "openai_tools": self.openai_tools,
+            "openai_tools_count": len(openai_tools),
+            "openai_tools": openai_tools,
             "has_tools": has_tools
         })
         
         tool_params = {}
         if has_tools:
             tool_params = {
-                "tools": self.openai_tools,
+                "tools": openai_tools,
                 "tool_choice": "auto"
             }
         
@@ -475,8 +606,8 @@ class ChatAgent:
 
         try:
             existing_messages = await self.conversation_store.get_messages(chat_id, limit=1)
-            
-            base_system_prompt = self.system_prompt
+
+            tools_by_name, openai_tools, base_system_prompt = await self._get_tools_for_chat(chat_id)
             if image_data:
                 image_context = "\n\nIMAGE CONTEXT: The user has uploaded an image with their message. You MUST use the explain_image tool to analyze it."
                 system_prompt_with_image = base_system_prompt + image_context

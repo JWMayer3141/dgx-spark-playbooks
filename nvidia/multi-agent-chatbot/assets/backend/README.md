@@ -25,6 +25,57 @@ The backend handles:
 
 FastAPI application with async support, integrated with vector databases for RAG functionality and WebSocket endpoints for real-time communication.
 
+## Revit MCP (Python)
+
+This backend can optionally load a Revit MCP server via environment variables. Two common setups:
+
+1. Revit MCP Python repo (stdio): set `REVIT_MCP_MAIN` to the absolute path of `main.py`. The backend will run it with `uv run --with mcp[cli] mcp run /absolute/path/to/main.py` (the same pattern shown in the Revit MCP Python README).
+2. Remote server (streamable HTTP): set `REVIT_MCP_URL` to the MCP endpoint (for example `http://localhost:8000/mcp`) and `REVIT_MCP_TRANSPORT=streamable_http`.
+
+Optional overrides:
+- `REVIT_MCP_COMMAND` and `REVIT_MCP_ARGS` let you supply a custom command; `REVIT_MCP_ARGS` is parsed with shell-style quoting.
+
+Example using the Revit MCP Python repo:
+```bash
+export REVIT_MCP_MAIN=/absolute/path/to/revit-mcp-python/main.py
+```
+
+Example using the `revit-mcp` Python package (uvx):
+```bash
+export REVIT_MCP_COMMAND=uvx
+export REVIT_MCP_ARGS="revit-mcp"
+```
+
+### Per-Chat Revit MCP
+
+You can bind a different Revit MCP server per chat. This is useful when each user has their own Revit instance.
+
+Set (or clear) the Revit MCP endpoint for a chat:
+```bash
+curl -X POST http://localhost:8000/chat/<chat_id>/revit \
+  -H "Content-Type: application/json" \
+  -d '{"revit_mcp_url":"http://<windows-ip>:8000/mcp","revit_mcp_transport":"http"}'
+```
+
+Fetch current settings:
+```bash
+curl http://localhost:8000/chat/<chat_id>/revit
+```
+
+Auto-configure Revit MCP using the caller's IP (no user input required):
+```bash
+curl -X POST http://localhost:8000/chat/<chat_id>/revit/auto
+```
+
+Optional headers (if you need non-defaults):
+```bash
+# defaults: port=8000, path=/mcp, transport=http
+curl -X POST http://localhost:8000/chat/<chat_id>/revit/auto \
+  -H "x-revit-mcp-port: 8000" \
+  -H "x-revit-mcp-path: /mcp" \
+  -H "x-revit-mcp-transport: http"
+```
+
 ## Docker Troubleshooting
 
 ### Container Issues

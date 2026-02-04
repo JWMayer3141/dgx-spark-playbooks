@@ -31,13 +31,13 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import List, Optional, Dict
 
-from fastapi import FastAPI, File, Form, UploadFile, HTTPException, BackgroundTasks, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, Form, UploadFile, HTTPException, BackgroundTasks, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from agent import ChatAgent
 from config import ConfigManager
 from logger import logger, log_request, log_response, log_error
-from models import ChatIdRequest, ChatRenameRequest, SelectedModelRequest
+from models import ChatIdRequest, ChatRenameRequest, SelectedModelRequest, ChatRevitConfigRequest
 from postgres_storage import PostgreSQLConversationStorage
 from utils import process_and_ingest_files_background
 from vector_store import create_vector_store_with_config
@@ -392,6 +392,97 @@ async def get_chat_metadata(chat_id: str):
         raise HTTPException(
             status_code=500,
             detail=f"Error getting chat metadata: {str(e)}"
+        )
+
+
+@app.get("/chat/{chat_id}/revit")
+async def get_chat_revit_config(chat_id: str):
+    """Get Revit MCP configuration for a chat."""
+    try:
+        if not await postgres_storage.exists(chat_id):
+            raise HTTPException(status_code=404, detail=f"Chat {chat_id} not found")
+
+        settings = await postgres_storage.get_chat_settings(chat_id)
+        return {
+            "revit_mcp_url": settings.get("revit_mcp_url"),
+            "revit_mcp_transport": settings.get("revit_mcp_transport"),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error getting Revit MCP settings: {str(e)}"
+        )
+
+
+@app.post("/chat/{chat_id}/revit")
+async def set_chat_revit_config(chat_id: str, request: ChatRevitConfigRequest):
+    """Set or clear Revit MCP configuration for a chat."""
+    try:
+        if not await postgres_storage.exists(chat_id):
+            raise HTTPException(status_code=404, detail=f"Chat {chat_id} not found")
+
+        await postgres_storage.set_chat_settings(
+            chat_id,
+            request.revit_mcp_url,
+            request.revit_mcp_transport,
+        )
+
+        if agent:
+            agent.clear_chat_tool_cache(chat_id)
+
+        return {
+            "status": "success",
+            "chat_id": chat_id,
+            "revit_mcp_url": (request.revit_mcp_url or "").strip() or None,
+            "revit_mcp_transport": (request.revit_mcp_transport or "").strip() or None,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error updating Revit MCP settings: {str(e)}"
+        )
+
+
+@app.post("/chat/{chat_id}/revit/auto")
+async def auto_set_chat_revit_config(chat_id: str, request: Request):
+    """Auto-configure Revit MCP based on the caller's IP address."""
+    try:
+        if not await postgres_storage.exists(chat_id):
+            raise HTTPException(status_code=404, detail=f"Chat {chat_id} not found")
+
+        forwarded_for = request.headers.get("x-forwarded-for")
+        client_ip = forwarded_for.split(",")[0].strip() if forwarded_for else request.client.host
+        port = request.headers.get("x-revit-mcp-port", "8000").strip()
+        path = request.headers.get("x-revit-mcp-path", "/mcp").strip() or "/mcp"
+        transport = request.headers.get("x-revit-mcp-transport", "http").strip() or "http"
+
+        if not path.startswith("/"):
+            path = f"/{path}"
+
+        revit_mcp_url = f"http://{client_ip}:{port}{path}"
+
+        await postgres_storage.set_chat_settings(chat_id, revit_mcp_url, transport)
+
+        if agent:
+            agent.clear_chat_tool_cache(chat_id)
+
+        return {
+            "status": "success",
+            "chat_id": chat_id,
+            "revit_mcp_url": revit_mcp_url,
+            "revit_mcp_transport": transport,
+            "detected_ip": client_ip,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error auto-configuring Revit MCP settings: {str(e)}"
         )
 
 

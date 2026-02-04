@@ -76,6 +76,7 @@ class PostgreSQLConversationStorage:
         self._message_cache: Dict[str, CacheEntry] = {}
         self._metadata_cache: Dict[str, CacheEntry] = {}
         self._image_cache: Dict[str, CacheEntry] = {}
+        self._settings_cache: Dict[str, CacheEntry] = {}
         self._chat_list_cache: Optional[CacheEntry] = None
         
         self._pending_saves: Dict[str, List[BaseMessage]] = {}
@@ -176,6 +177,17 @@ class PostgreSQLConversationStorage:
                     FOREIGN KEY (chat_id) REFERENCES conversations(chat_id) ON DELETE CASCADE
                 )
             """)
+
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS chat_settings (
+                    chat_id VARCHAR(255) PRIMARY KEY,
+                    revit_mcp_url TEXT,
+                    revit_mcp_transport VARCHAR(50),
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (chat_id) REFERENCES conversations(chat_id) ON DELETE CASCADE
+                )
+            """)
             
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS images (
@@ -205,6 +217,16 @@ class PostgreSQLConversationStorage:
             await conn.execute("""
                 CREATE TRIGGER update_conversations_updated_at
                     BEFORE UPDATE ON conversations
+                    FOR EACH ROW
+                    EXECUTE FUNCTION update_updated_at_column()
+            """)
+
+            await conn.execute("""
+                DROP TRIGGER IF EXISTS update_chat_settings_updated_at ON chat_settings
+            """)
+            await conn.execute("""
+                CREATE TRIGGER update_chat_settings_updated_at
+                    BEFORE UPDATE ON chat_settings
                     FOR EACH ROW
                     EXECUTE FUNCTION update_updated_at_column()
             """)
@@ -270,13 +292,14 @@ class PostgreSQLConversationStorage:
         """Invalidate cache entries for a chat."""
         self._message_cache.pop(chat_id, None)
         self._metadata_cache.pop(chat_id, None)
+        self._settings_cache.pop(chat_id, None)
         self._chat_list_cache = None
 
     async def exists(self, chat_id: str) -> bool:
         """Check if a conversation exists (with caching)."""
         cached_messages = self._get_cached_messages(chat_id)
         if cached_messages is not None:
-            return len(cached_messages) > 0
+            return True
         
         async with self.pool.acquire() as conn:
             result = await conn.fetchval(
@@ -499,6 +522,37 @@ class PostgreSQLConversationStorage:
             
             return metadata
 
+    async def get_chat_settings(self, chat_id: str) -> Dict[str, Optional[str]]:
+        """Get chat settings with caching."""
+        cache_entry = self._settings_cache.get(chat_id)
+        if cache_entry and not cache_entry.is_expired():
+            self._cache_hits += 1
+            return cache_entry.data
+
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT revit_mcp_url, revit_mcp_transport FROM chat_settings WHERE chat_id = $1",
+                chat_id
+            )
+            self._db_operations += 1
+
+            if row:
+                settings = {
+                    "revit_mcp_url": row["revit_mcp_url"],
+                    "revit_mcp_transport": row["revit_mcp_transport"],
+                }
+            else:
+                settings = {}
+
+            self._settings_cache[chat_id] = CacheEntry(
+                data=settings,
+                timestamp=time.time(),
+                ttl=self.cache_ttl
+            )
+            self._cache_misses += 1
+
+            return settings
+
     async def set_chat_metadata(self, chat_id: str, name: str) -> None:
         """Set chat metadata."""
         async with self.pool.acquire() as conn:
@@ -514,6 +568,46 @@ class PostgreSQLConversationStorage:
         
         self._metadata_cache[chat_id] = CacheEntry(
             data={"name": name},
+            timestamp=time.time(),
+            ttl=self.cache_ttl
+        )
+
+    async def set_chat_settings(
+        self,
+        chat_id: str,
+        revit_mcp_url: Optional[str],
+        revit_mcp_transport: Optional[str],
+    ) -> None:
+        """Set chat settings (revit MCP) or clear if URL is empty."""
+        cleaned_url = (revit_mcp_url or "").strip()
+        cleaned_transport = (revit_mcp_transport or "").strip()
+
+        async with self.pool.acquire() as conn:
+            if not cleaned_url:
+                await conn.execute(
+                    "DELETE FROM chat_settings WHERE chat_id = $1",
+                    chat_id
+                )
+                self._db_operations += 1
+                settings: Dict[str, Optional[str]] = {}
+            else:
+                await conn.execute("""
+                    INSERT INTO chat_settings (chat_id, revit_mcp_url, revit_mcp_transport)
+                    VALUES ($1, $2, $3)
+                    ON CONFLICT (chat_id)
+                    DO UPDATE SET
+                        revit_mcp_url = EXCLUDED.revit_mcp_url,
+                        revit_mcp_transport = EXCLUDED.revit_mcp_transport,
+                        updated_at = CURRENT_TIMESTAMP
+                """, chat_id, cleaned_url, cleaned_transport or None)
+                self._db_operations += 1
+                settings = {
+                    "revit_mcp_url": cleaned_url,
+                    "revit_mcp_transport": cleaned_transport or None,
+                }
+
+        self._settings_cache[chat_id] = CacheEntry(
+            data=settings,
             timestamp=time.time(),
             ttl=self.cache_ttl
         )
